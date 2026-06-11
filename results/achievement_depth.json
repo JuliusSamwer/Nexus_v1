@@ -1,0 +1,112 @@
+[
+  {
+    "achievement": "collect_wood",
+    "depth": 1,
+    "success": 0.9986328125
+  },
+  {
+    "achievement": "collect_sapling",
+    "depth": 1,
+    "success": 0.992578125
+  },
+  {
+    "achievement": "collect_drink",
+    "depth": 1,
+    "success": 0.9369140625
+  },
+  {
+    "achievement": "place_table",
+    "depth": 2,
+    "success": 0.99609375
+  },
+  {
+    "achievement": "place_plant",
+    "depth": 2,
+    "success": 0.9916015625
+  },
+  {
+    "achievement": "wake_up",
+    "depth": 2,
+    "success": 0.923046875
+  },
+  {
+    "achievement": "defeat_zombie",
+    "depth": 2,
+    "success": 0.9134765625
+  },
+  {
+    "achievement": "eat_cow",
+    "depth": 2,
+    "success": 0.892578125
+  },
+  {
+    "achievement": "make_wood_pickaxe",
+    "depth": 3,
+    "success": 0.9921875
+  },
+  {
+    "achievement": "make_wood_sword",
+    "depth": 3,
+    "success": 0.984765625
+  },
+  {
+    "achievement": "collect_stone",
+    "depth": 3,
+    "success": 0.9796875
+  },
+  {
+    "achievement": "defeat_skeleton",
+    "depth": 3,
+    "success": 0.7666015625
+  },
+  {
+    "achievement": "place_stone",
+    "depth": 4,
+    "success": 0.9724609375
+  },
+  {
+    "achievement": "make_stone_pickaxe",
+    "depth": 4,
+    "success": 0.9365234375
+  },
+  {
+    "achievement": "collect_coal",
+    "depth": 4,
+    "success": 0.91015625
+  },
+  {
+    "achievement": "make_stone_sword",
+    "depth": 4,
+    "success": 0.8931640625
+  },
+  {
+    "achievement": "place_furnace",
+    "depth": 5,
+    "success": 0.9556640625
+  },
+  {
+    "achievement": "collect_iron",
+    "depth": 5,
+    "success": 0.6642578125
+  },
+  {
+    "achievement": "make_iron_sword",
+    "depth": 6,
+    "success": 0.3240234375
+  },
+  {
+    "achievement": "make_iron_pickaxe",
+    "depth": 6,
+    "success": 0.3158203125
+  },
+  {
+    "achievement": "collect_diamond",
+    "depth": 7,
+    "success": 0.008984375
+  },
+  {
+    "achievement": "eat_plant",
+    "depth": 7,
+    "success": 0.0005859375
+  }
+]

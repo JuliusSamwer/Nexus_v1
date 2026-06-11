@@ -1,0 +1,89 @@
+{
+  "runs": [
+    {
+      "label": "baseline",
+      "logdir": "logdir/crafter_smoke",
+      "score": 0.2334044670569151,
+      "success": {
+        "collect_drink": 0.0,
+        "collect_sapling": 0.0,
+        "collect_wood": 0.0,
+        "defeat_zombie": 0.0,
+        "eat_cow": 0.0,
+        "place_plant": 0.0,
+        "place_table": 0.0,
+        "wake_up": 1.0,
+        "collect_stone": 0.0,
+        "defeat_skeleton": 0.0,
+        "make_wood_pickaxe": 0.0,
+        "make_wood_sword": 0.0,
+        "collect_coal": 0.0,
+        "make_stone_pickaxe": 0.0,
+        "make_stone_sword": 0.0,
+        "place_stone": 0.0,
+        "collect_iron": 0.0,
+        "place_furnace": 0.0,
+        "make_iron_pickaxe": 0.0,
+        "make_iron_sword": 0.0,
+        "collect_diamond": 0.0,
+        "eat_plant": 0.0
+      },
+      "snapshot_desc": "final eval round (3 episodes)",
+      "n_episodes": 30
+    }
+  ],
+  "refs": [
+    {
+      "label": "EMERALD",
+      "score": 57.035628617982965,
+      "success": {
+        "collect_drink": 0.9369140625,
+        "collect_sapling": 0.992578125,
+        "collect_wood": 0.9986328125,
+        "defeat_zombie": 0.9134765625,
+        "eat_cow": 0.892578125,
+        "place_plant": 0.9916015625,
+        "place_table": 0.99609375,
+        "wake_up": 0.923046875,
+        "collect_stone": 0.9796875,
+        "defeat_skeleton": 0.7666015625,
+        "make_wood_pickaxe": 0.9921875,
+        "make_wood_sword": 0.984765625,
+        "collect_coal": 0.91015625,
+        "make_stone_pickaxe": 0.9365234375,
+        "make_stone_sword": 0.8931640625,
+        "place_stone": 0.9724609375,
+        "collect_iron": 0.6642578125,
+        "place_furnace": 0.9556640625,
+        "make_iron_pickaxe": 0.3158203125,
+        "make_iron_sword": 0.3240234375,
+        "collect_diamond": 0.008984375,
+        "eat_plant": 0.0005859375
+      }
+    }
+  ],
+  "causal_depth": {
+    "collect_wood": 1,
+    "place_table": 2,
+    "place_plant": 2,
+    "collect_sapling": 1,
+    "collect_drink": 1,
+    "make_wood_pickaxe": 3,
+    "make_wood_sword": 3,
+    "collect_stone": 3,
+    "place_stone": 4,
+    "make_stone_pickaxe": 4,
+    "make_stone_sword": 4,
+    "eat_cow": 2,
+    "defeat_zombie": 2,
+    "defeat_skeleton": 3,
+    "wake_up": 2,
+    "place_furnace": 5,
+    "collect_coal": 4,
+    "collect_iron": 5,
+    "make_iron_pickaxe": 6,
+    "make_iron_sword": 6,
+    "collect_diamond": 7,
+    "eat_plant": 7
+  }
+}

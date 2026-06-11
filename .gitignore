@@ -1,0 +1,51 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+.ipynb_checkpoints/
+
+# Envs
+.venv/
+venv/
+env_jax/
+env_torch/
+
+# Results / artifacts (keep code, not outputs)
+results/**/*.pt
+results/**/*.ckpt
+results/**/*.npz
+results/**/*.png
+results/**/*.mp4
+wandb/
+outputs/
+multirun/
+logs/
+*.log
+
+# OS
+.DS_Store
+
+# Large model/data caches
+*.pth
+!third_party/**/*.pth
+data/
+checkpoints/
+
+# Keep result manifests / json metrics under version control
+!results/**/*.json
+!results/.gitkeep
+
+# Training outputs / local agent state (regenerable; not for VCS)
+logdir/
+.claude/
+
+# Master doc — private ("only for us"): the .docx artifact AND its source generator
+*.docx
+~$*
+tools/build_master_doc.py
+
+# External code — use upstream repos + your Drive copy; not vendored here (see README)
+third_party/
