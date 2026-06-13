@@ -1,18 +1,22 @@
-"""Nexus_v1 — a discovered-boundary semi-MDP world model built on EMERALD.
+"""Nexus — Segment-Native World Model (Strict Bottleneck), build outline v1.
 
-Two tiers from one buffer:
-  * STEP tier  — EMERALD (reused verbatim from `emerald_torch`, world model untouched),
-                 with an active-skill embedding added as an input to the actor/critic only.
-  * SKILL tier — NEW: a VQ skill codebook + skill encoder (posterior over skills),
-                 a jumpy option-model world model `p(z_term, Σr, τ, continue | Sₙ, kₙ)`
-                 (Sutton–Precup–Singh, one level up), an HL actor (skill prior) and an
-                 HL critic discounted by γ^τ.
+The trajectory's latent is two token streams:
+  * FAST frame tokens z_t (EMERALD's 4x4 spatial categoricals), generated segment-locally;
+  * SLOW segment tokens u_n (G categoricals), the ONLY information path across boundaries.
 
-The contribution is the boundary discovery: segmentation is a latent variable inferred
-by an exact semi-Markov forward–backward DP (over a top-M proposal set) under an MDL
-objective — jumpy-NLL + code-rate + switch-cost. Reward never touches the boundaries
-through its gradient; it shapes them only by being one of the things each segment must
-predict (`Σr`). See `segment.py`.
+Strictness (§2.3): no component except the slow stream has a receptive field crossing a
+segment boundary, except through the bounded leak channel W (width `w`, default 0). The
+fast state is never zeroed — it is REBUILT at each boundary from (u_n, z_{t_n} [, W·h_prev]).
 
-This package is self-contained except for importing `emerald_torch` (the step tier).
+Modules:
+  config.py    — composes EMERALD parts-library sizes with slow-tier params; w/G dials.
+  segments.py  — N0: scheduled boundaries, seg masks, per-segment pooling.
+  common.py    — shared embeds / slow-token codebook / dist re-exports.
+  fast.py      — §2.3 fast tier (segment-local TSSM + u-FiLM MaskGIT + boundary rebuild).
+  slow.py      — §2.4 slow posterior (segment encoder) + §2.5 slow prior / jumpy model.
+  model.py     — NexusWM: ties the tiers, the §4 loss, the §8 diagnostics.
+  replay.py    — stream replay (cross-episode length-T windows).
+  train.py     — N1 loop (WM-only, seg=scheduled), the {w}x{G} grid.
+
+Self-contained except for importing `emerald_torch` (the parts library).
 """

@@ -68,7 +68,9 @@ class SelfAttention(nn.Module):
         self.proj = nn.Linear(dim, dim)
         self.drop = nn.Dropout(drop)
 
-    def forward(self, x, causal=False):
+    def forward(self, x, causal=False, attn_mask=None):
+        """attn_mask: optional bool (T,T) or (B,T,T) where True == BLOCKED (cannot
+        attend). Composes with `causal`. Used by nexus for segment-local attention."""
         B, T, D = x.shape
         q, k, v = self.qkv(x).chunk(3, dim=-1)
         q = q.view(B, T, self.h, self.dh).transpose(1, 2)
@@ -78,6 +80,9 @@ class SelfAttention(nn.Module):
         if causal:
             m = torch.triu(torch.ones(T, T, device=x.device, dtype=torch.bool), 1)
             att = att.masked_fill(m, float("-inf"))
+        if attn_mask is not None:
+            m = attn_mask if attn_mask.dim() == 3 else attn_mask.unsqueeze(0)
+            att = att.masked_fill(m.unsqueeze(1), float("-inf"))   # broadcast over heads
         att = self.drop(att.softmax(dim=-1))
         out = (att @ v).transpose(1, 2).reshape(B, T, D)
         return self.proj(out)
@@ -93,9 +98,9 @@ class TransformerBlock(nn.Module):
                                 nn.Linear(ff_ratio * dim, dim))
         self.drop = nn.Dropout(drop)
 
-    def forward(self, x, causal=False):
+    def forward(self, x, causal=False, attn_mask=None):
         # post-norm (EMERALD module_pre_norm=False)
-        x = self.n1(x + self.drop(self.attn(x, causal=causal)))
+        x = self.n1(x + self.drop(self.attn(x, causal=causal, attn_mask=attn_mask)))
         x = self.n2(x + self.drop(self.ff(x)))
         return x
 
@@ -108,11 +113,16 @@ class Transformer(nn.Module):
             [TransformerBlock(dim, heads, ff_ratio, drop) for _ in range(num_blocks)])
         self.pos = nn.Parameter(torch.zeros(1, max_pos, dim)) if pos_emb else None
 
-    def forward(self, x, causal=False):
+    def forward(self, x, causal=False, attn_mask=None, pos_ids=None):
+        """pos_ids: optional long (T,) or (B,T) selecting position embeddings (nexus uses
+        within-segment offsets so the model generalizes across segments)."""
         if self.pos is not None:
-            x = x + self.pos[:, :x.shape[1]]
+            if pos_ids is None:
+                x = x + self.pos[:, :x.shape[1]]
+            else:
+                x = x + self.pos[0][pos_ids]                       # (...,T,D) broadcast
         for blk in self.blocks:
-            x = blk(x, causal=causal)
+            x = blk(x, causal=causal, attn_mask=attn_mask)
         return x
 
 

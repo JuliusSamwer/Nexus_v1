@@ -1,4 +1,4 @@
-"""Shared building blocks for the Nexus skill tier (reusing emerald_torch primitives)."""
+"""Shared building blocks for the segment-native tiers (reusing emerald_torch parts)."""
 
 import torch
 import torch.nn as nn
@@ -9,7 +9,7 @@ from emerald_torch import dists as edists
 
 class StochEmbed(nn.Module):
     """Embed a spatial categorical latent stoch (..., S*V, 4, 4) -> (..., out_dim).
-    Same shape trick as EMERALD's TSSM encoder, but standalone for the skill tier."""
+    Same shape trick as EMERALD's TSSM encoder, standalone for the slow tier."""
 
     def __init__(self, feat_size, out_dim, reduced=128):
         super().__init__()
@@ -31,9 +31,22 @@ def mlp(dim_in, hidden, out_dim, layers=2):
     return nn.Sequential(trunk, nn.Linear(d, out_dim))
 
 
-# Re-export the distributions the skill tier needs.
+class SlowTokenEmbed(nn.Module):
+    """Embed the G categorical slow tokens u_n (one-hot, B,N,G,C) -> (B,N,emb_dim).
+    Per-group codebook, summed over groups (the slow-tier analog of a stoch embed)."""
+
+    def __init__(self, G, num_classes, emb_dim):
+        super().__init__()
+        self.weight = nn.Parameter(torch.randn(G, num_classes, emb_dim) * 0.02)
+
+    def forward(self, onehot):
+        return torch.einsum("bngc,gce->bne", onehot, self.weight)
+
+
+# Re-export distributions the slow tier needs.
 OneHotDist = edists.OneHotDist
 SymLogDiscreteDist = edists.SymLogDiscreteDist
 BernoulliDist = edists.BernoulliDist
+MSEDist = edists.MSEDist
 kl_onehot = edists.kl_onehot
 symlog, symexp = edists.symlog, edists.symexp

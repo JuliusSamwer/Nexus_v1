@@ -1,53 +1,75 @@
-# `nexus/` — Nexus_v1: discovered-boundary semi-MDP world model
+# `nexus/` — Segment-Native World Model (Strict Bottleneck)
 
-A second world model on top of EMERALD that pays its error budget **per discovered
-skill** instead of per environment step. The contribution is **boundary discovery as
-compression**: where skills begin and end is a latent variable inferred by an exact
-semi-Markov DP under an MDL objective — not a heuristic, not reward backprop.
+The trajectory's latent is **two token streams**: fast frame tokens `z_t` generated
+*segment-locally*, and slow segment tokens `u_n` that are the **only** information path
+across boundaries. Generation runs coarse-to-fine in time: segments first, frames on
+demand.
 
-Self-contained except for importing `emerald_torch` (the step tier).
+**Strictness commitment (§2.3):** no component except the slow stream has a receptive
+field that crosses a segment boundary — except through the bounded leak channel `W`, whose
+width `w` is a config dial with `w=0` (fully strict) as the default. The fast state is
+never zeroed; it is **rebuilt** at each boundary from `(u_n, z_{t_n} [, W·h_prev])`. The
+boundary frame's full latent `z_{t_n}` always crosses; what the bottleneck cuts is
+unobservable internal memory only.
+
+Self-contained except for importing `emerald_torch` (the parts library: encoder, decoder,
+TSSM recurrence, MaskGIT, two-hot heads, categorical-ST machinery — reused verbatim).
 
 ## Modules
 
 | File | Role |
 |------|------|
-| `config.py` | §10 starting card; composes the (untouched) EMERALD step-tier config with skill-tier params. |
-| `skill.py` | **VQ codebook** (EMA + dead-code restart) + **skill encoder** `q(k\|segment)` — the posterior over skills. |
-| `jumpy.py` | **Option-model WM** `p(z_term, Σr, τ, continue \| Sₙ, kₙ)`: `Hₙ` causal transformer, jumpy terminal-latent **MaskGIT**, `Σr`/`τ`/continue heads, HL actor (prior) + HL critic (`γ^τ`). |
-| `segment.py` | **THE core.** Boundary proposer → top-M; exact **semi-Markov forward–backward DP** + Viterbi under the **MDL** emission (jumpy-NLL + code-rate + switch-cost). |
-| `model.py` | `NexusAgent`: step tier (EMERALD) + skill tier; jumpy WM loss; HL actor-critic. |
-| `train.py` | The 5-stage loop (§8). Reuses EMERALD collect/eval; same `metrics.jsonl`/`eval_eps`. |
+| `config.py` | Composes EMERALD parts-library sizes with slow-tier params. Headline dials: `w` (leak width, §2.3) and `G` (slow tokens/segment, §2.4). |
+| `segments.py` | **N0.** `seg=scheduled`: boundary every `ell_bar`±jitter. Builds `seg_id`, within-segment `pos_ids`, the block-diagonal-causal `attn_mask` (this tensor *is* the strictness), and per-segment pooling (Σr, continue, a-summary). |
+| `common.py` | Shared stoch embed, slow-token codebook, dist re-exports. |
+| `fast.py` | **§2.3 fast tier.** Segment-local TSSM with the boundary rebuild `Init(u_n, z_{t_n}, W·h_prev)` + w-leak (detached two-pass when `w>0`), u-FiLM on the MaskGIT prior, EMERALD reward/continue/decoder. Boundary frames are excluded from the fast prior (the slow grounding head owns them). |
+| `slow.py` | **§2.4 slow posterior** (bidirectional segment encoder; `G` query tokens cross-attend → `G` categorical-256 tokens `u_n`; ST + unimix) and **§2.5 slow prior / jumpy model** (causal transformer over slow history; heads for `u`, `τ`, grounding MaskGIT `z_{t_{n+1}}`, `Σr`, continue). The only boundary-crossing module. |
+| `model.py` | `NexusWM`: shared encoder + the tiers, the §4 loss, and the §8 diagnostics. |
+| `replay.py` | Stream replay — length-T windows across episode seams (random Crafter episodes are ~170 steps; T=256 needs streaming). |
+| `train.py` | **N1** loop (WM-only, `seg=scheduled`). Random-policy collection; the `{w}×{G}` grid via `--w`/`--G`. |
 
-## Run (smoke)
+## Run
 
+**Smoke (shape shakeout, CPU/MPS):**
 ```bash
-python3 -m nexus.train --configs tiny --device mps --logdir logdir/nexus_tiny --steps 200
+python3 -m nexus.train --configs tiny --device cpu --logdir logdir/nexus_smoke --w 0 --G 4 --steps 200
 ```
 
-`tiny` is a shape-test preset. A real preset (full dims, GPU) is a follow-up once v1
-training dynamics are tuned. Verified end-to-end: both tiers train, segmentation yields
-variable-length segments, the VQ codebook activates, eval/checkpoint written.
+**N1 run (GPU). Start with the two corners of the §11.4 grid:**
+```bash
+# strict reference
+python3 -m nexus.train --configs crafter --device cuda --logdir logdir/nexus_w0_G4  --w 0  --G 4 --steps 100000
+# leak reference
+python3 -m nexus.train --configs crafter --device cuda --logdir logdir/nexus_w64_G4 --w 64 --G 4 --steps 100000
+```
+Then fill the grid `{w∈0,16,64} × {G∈2,4,8}`. The **post-boundary spike per cell** is the
+N1 deliverable.
 
-## v1 scope — what's built vs deferred (be honest in the paper)
+## What to watch (§8 — logged every `log_every` to `metrics.jsonl`)
 
-**Built & running:** the full skill tier — VQ skills, skill encoder, jumpy option-model
-WM (terminal MaskGIT + `Σr`/`τ`/continue + `Hₙ` with h-input dropout 0.3), HL actor/critic
-with `γ^τ`, the boundary proposer, and the **exact semi-Markov DP under MDL** (forward–
-backward marginals + Viterbi over a top-M proposal set).
+- **`post_boundary_spike`** *(§8.1, the headline)* — fast-prior NLL at offset 1 after a
+  boundary minus mid-segment NLL. Small at `w=0` ⇒ strictness is free, `(u,z_b)` suffices.
+  Shrinking as `w` grows ⇒ unobservable environmental memory genuinely needed — *that's the
+  figure*. Persisting large at `w=64` ⇒ an Init/`G` problem, not a leak problem (F1).
+  (Per-offset `fast_nll_off1..5` and `fast_nll_mid` are also logged.)
+- **`slow_advantage`** *(§8.2)* — `copy_nll_diag − ground_nll_diag`: grounding's next-
+  boundary-frame NLL vs copying the current boundary frame. The tier-earns-its-existence
+  number; should climb positive.
+- **`u_perplexity`** *(§8.4)* — per-token perplexity of the slow posterior (collapse alarm,
+  out of `u_classes`); **`u_kl`** — code rate (posterior actually informs the prior).
 
-**Documented v1 simplifications / gaps** (the fragile joints §9 names — flagged, not hidden):
-1. **Step actor not yet skill-conditioned** (Stage 4 "close the loop"). The step tier
-   runs as EMERALD verbatim; passing `e(kₙ)` into the step AC is the one deferred change.
-2. **DP emission conditions on `(z_a, k)` with `Hₙ`=0** (v1 decoupling); the full
-   `Hₙ`-conditioned jumpy WM is trained on the *chosen* segments in Stage 3. This breaks
-   the chicken-and-egg within one backward while keeping the MDL loop across stages.
-3. **Segment representation = mean of globally-contextualized per-step features** (one
-   bidirectional pass over the window), rather than a per-segment transformer pass —
-   an efficiency choice for batched DP scoring.
-4. **Training dynamics are not tuned.** The MDL fixed point (avoid all-length-1 / one
-   giant segment), proposer quality, and codebook collapse are the live risks §9 calls
-   out — the switch-cost + code-rate regularizers are in place but need empirical work.
+## N1 simplifications (honest, flagged not hidden)
 
-**Metrics to watch** (logged): `vq_perplexity` (codebook collapse alarm), `mean_seg_len`
-/ `mean_n_segs` (degenerate-fixed-point alarm), `hl_*` losses. Boundary↔achievement F1
-(the H2 payoff figure) is eval-only and not yet wired.
+1. **Boundaries shared across a batch** (one jittered schedule per batch) so every
+   segment-local op is cleanly batched. N3's `seg=learned` replaces this with a per-
+   sequence boundary posterior.
+2. **`w>0` leak is detached across segments** (two forward passes; the leak source is the
+   previous pass's deter, stop-grad). A narrow *environmental-memory* channel, not a
+   gradient bypass — consistent with the bottleneck's intent.
+3. **Stream replay crosses episode seams** inside a window (cont-flagged). Random episodes
+   are too short for within-episode T=256.
+4. **No actor yet** — N1 is WM-only and collects with a random policy. The frozen-recipe AC
+   (N2) replaces `collect_episode` and reads the new state `(h_t, z_t, u_n)`.
+
+Deferred to later phases (out of N1, per §10): learned segmenter (N3), `γ^τ` slow critic +
+jumpy value backup (N4), rollout-depth curve (§8.3), the soft-bottleneck flag (§9 F1).

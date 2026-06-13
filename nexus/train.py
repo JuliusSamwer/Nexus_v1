@@ -1,15 +1,15 @@
-"""Train Nexus_v1 on Crafter — the 5-stage loop (§8).
+"""Train the segment-native world model — Phase N1 (full WM, seg=scheduled).
 
-  Stage 0  collect          — step actor acts; replay fills (one buffer, two sample lengths)
-  Stage 1  step WM + step AC — EMERALD on len-step.L (reused verbatim)
-  Stage 2  segment          — semi-Markov DP on len-T → boundaries → skill codes
-  Stage 3  jumpy WM + HL AC  — option-model heads + Hₙ; HL actor/critic (γ^τ)
-  Stage 4  close             — step actor conditioned on k  [v1 GAP: deferred]
+WM-only: this trains the world model and reports the §8 diagnostics that answer the
+bottleneck bet — does (u_n, z_{t_n}) suffice to re-init prediction across a boundary?
+There is no actor yet (that is N2; collection here is random-policy, and the loop is
+structured so an actor can replace `collect_episode`).
 
-Reuses emerald_torch's collect/eval/step-train wholesale; writes the same
-metrics.jsonl / eval_eps so harness/eval_overlay.py reads it.
+The N1 headline experiment is the {w} x {G} grid (§11.4); pass --w / --G to set a cell and
+tag the logdir. Start with the corners: w=0/G=4 (strict reference), w=64/G=4 (leak ref).
 
-    python3 -m nexus.train --configs tiny --device mps --logdir logdir/nexus_tiny --steps 200
+    python3 -m nexus.train --configs crafter --device cuda \
+        --logdir logdir/nexus_w0_G4 --w 0 --G 4 --steps 100000
 """
 
 import argparse
@@ -19,97 +19,99 @@ import numpy as np
 import torch
 
 from emerald_torch import env as envmod
-from emerald_torch.replay import ReplayBuffer
-from emerald_torch.train import (make_optims, run_episode, prefill_episode,
-                                 evaluate, train_step as step_train)
+from emerald_torch.train import prefill_episode
 from . import config as config_mod
-from .model import NexusAgent
+from . import segments as segmod
+from .model import NexusWM
+from .replay import StreamReplay
 
 
-def hl_train_step(agent, opt, hl, cfg):
-    agent.train()
-    wm_loss, m1, starts = agent.hl_world_model_loss(hl)
-    a_loss, v_loss, m2 = agent.hl_actor_critic_loss(starts)
-    loss = wm_loss + a_loss + v_loss
+def train_step(model, opt, batch, segs, cfg):
+    model.train()
+    loss, metrics = model.loss(batch, segs)
     opt.zero_grad(set_to_none=True)
     loss.backward()
-    torch.nn.utils.clip_grad_norm_(agent.skill_tier_parameters(), cfg.hl_grad_clip)
+    torch.nn.utils.clip_grad_norm_(model.parameters(), cfg.step.model_grad_max_norm)
     opt.step()
-    return {**m1, **m2}
+    return metrics
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--configs", default="tiny", choices=list(config_mod.PRESETS))
+    ap.add_argument("--configs", default="crafter", choices=list(config_mod.PRESETS))
     ap.add_argument("--logdir", required=True)
-    ap.add_argument("--device", default="mps")
-    ap.add_argument("--steps", type=int, default=20000)
-    ap.add_argument("--hl_every", type=int, default=4, help="step-trains between HL trains")
+    ap.add_argument("--device", default="cuda")
+    ap.add_argument("--steps", type=int, default=100000, help="env steps")
+    ap.add_argument("--w", type=int, default=None, help="leak width override (0/16/64)")
+    ap.add_argument("--G", type=int, default=None, help="slow tokens per segment override")
     ap.add_argument("--seed", type=int, default=0)
     args = ap.parse_args()
 
-    torch.manual_seed(args.seed); np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    np.random.seed(args.seed)
+    rng = np.random.RandomState(args.seed)
     cfg = config_mod.PRESETS[args.configs]()
-    cfg.step.att_context_left = min(cfg.step.att_context_left, cfg.step.L)
-    device = args.device if (args.device != "mps" or torch.backends.mps.is_available()) else "cpu"
+    if args.w is not None:
+        cfg.w = args.w
+    if args.G is not None:
+        cfg.G = args.G
+
+    dev = args.device
+    if dev == "cuda" and not torch.cuda.is_available():
+        dev = "mps" if torch.backends.mps.is_available() else "cpu"
+    if dev == "mps" and not torch.backends.mps.is_available():
+        dev = "cpu"
     os.makedirs(args.logdir, exist_ok=True)
-    print(f"Nexus_v1 | preset={args.configs} device={device} steps={args.steps}")
+    print(f"NexusWM (N1) | preset={args.configs} device={dev} "
+          f"T={cfg.T} ell_bar={cfg.ell_bar} w={cfg.w} G={cfg.G} steps={args.steps}")
 
     env = envmod.CrafterEnv(seed=args.seed)
-    eval_env = envmod.CrafterEnv(seed=args.seed + 10000)
-    agent = NexusAgent(cfg, env.num_actions).to(device)
-    print(f"params: total={sum(p.numel() for p in agent.parameters()):,} "
-          f"(step={sum(p.numel() for p in agent.step.parameters()):,}, "
-          f"skill-tier={sum(p.numel() for p in agent.skill_tier_parameters()):,})")
-    step_optims = make_optims(agent.step, cfg.step)
-    hl_opt = torch.optim.Adam(agent.skill_tier_parameters(), lr=cfg.hl_lr, eps=cfg.hl_eps,
-                              weight_decay=cfg.weight_decay)
-    replay = ReplayBuffer(capacity=int(1e6), num_actions=env.num_actions)
+    model = NexusWM(cfg, env.num_actions).to(dev)
+    n_params = sum(p.numel() for p in model.parameters())
+    print(f"params: total={n_params:,} "
+          f"(fast={sum(p.numel() for p in model.fast.parameters()):,}, "
+          f"slow={sum(p.numel() for p in model.post.parameters()) + sum(p.numel() for p in model.prior.parameters()):,})")
+    opt = torch.optim.Adam(model.parameters(), lr=cfg.step.model_lr,
+                           eps=cfg.step.model_eps, weight_decay=cfg.weight_decay)
+    replay = StreamReplay(capacity=min(args.steps + cfg.prefill, 200000),
+                          num_actions=env.num_actions)
     writer = envmod.MetricsWriter(args.logdir)
 
-    print(f"Prefilling {cfg.prefill} steps...")
-    while replay.num_steps < cfg.prefill:
+    print(f"Prefilling {cfg.prefill} steps (random policy)...")
+    while replay.num_steps < max(cfg.prefill, cfg.T):
         replay.add_episode(prefill_episode(env, cfg.step).to_replay())
 
-    env_steps, train_acc, n_train, last_log = 0, 0.0, 0, 0
+    env_steps, train_acc, last_log = 0, 0.0, 0
     while env_steps < args.steps:
-        ep, ret = run_episode(agent.step, env, cfg.step, device, sample=True)
-        rep = ep.to_replay()
-        replay.add_episode(rep)
-        env_steps += len(rep["reward"])
-        train_acc += cfg.train_ratio * len(rep["reward"])
+        ep = prefill_episode(env, cfg.step).to_replay()      # N1: random-policy collection
+        replay.add_episode(ep)
+        env_steps += len(ep["reward"])
+        train_acc += cfg.train_ratio * len(ep["reward"])
         metrics = None
-        while train_acc >= 1.0 and replay.can_sample(cfg.step.L):
-            batch = replay.sample(cfg.step.batch_size, cfg.step.L, device)
-            metrics = step_train(agent.step, step_optims, batch, cfg.step)
-            n_train += 1
-            # Stage 2-3: HL train on a len-T window, less frequently
-            if n_train % args.hl_every == 0 and replay.can_sample(cfg.T):
-                img = replay.sample(max(2, cfg.step.batch_size // 4), cfg.T, device)
-                hl = agent.encode_hl(img)
-                hlm = hl_train_step(agent, hl_opt, hl, cfg)
-                metrics.update(hlm)
+        while train_acc >= 1.0 and replay.can_sample(cfg.T):
+            batch = replay.sample(cfg.batch_size, cfg.T, dev)
+            segs = segmod.make_segments(cfg, dev, rng)        # fresh schedule per batch
+            metrics = train_step(model, opt, batch, segs, cfg)
             train_acc -= 1.0
 
         if metrics is not None and env_steps - last_log >= cfg.log_every:
-            metrics["train_return"] = ret
+            metrics["env_steps"] = env_steps
+            metrics["w"], metrics["G"] = cfg.w, cfg.G
             writer.write(env_steps, metrics)
             last_log = env_steps
-            seglen = metrics.get("mean_seg_len", float("nan"))
-            print(f"[{env_steps:>7}] step_model={metrics['model_loss']:.0f} "
-                  f"| hl_term={metrics.get('hl_terminal', float('nan')):.2f} "
-                  f"hl_tau={metrics.get('hl_tau', float('nan')):.2f} "
-                  f"vq_ppl={metrics.get('vq_perplexity', float('nan')):.1f} "
-                  f"seglen={seglen:.1f} | ep_ret={ret:.1f}")
+            print(f"[{env_steps:>7}] loss={metrics['loss']:.1f} "
+                  f"img={metrics['fast_image']:.1f} "
+                  f"spike={metrics.get('post_boundary_spike', float('nan')):.2f} "
+                  f"ground_nll={metrics['ground_nll_diag']:.1f} "
+                  f"slow_adv={metrics['slow_advantage']:.1f} "
+                  f"u_ppl={metrics['u_perplexity']:.1f}")
 
-        if env_steps // cfg.eval_every > (env_steps - len(rep["reward"])) // cfg.eval_every:
-            evaluate(agent.step, eval_env, cfg.step, device, args.logdir, env_steps, writer)
-            torch.save({"agent": agent.state_dict(), "step": env_steps},
-                       os.path.join(args.logdir, "latest.pt"))
+        if env_steps // cfg.save_every > (env_steps - len(ep["reward"])) // cfg.save_every:
+            torch.save({"model": model.state_dict(), "step": env_steps, "cfg_w": cfg.w,
+                        "cfg_G": cfg.G}, os.path.join(args.logdir, "latest.pt"))
 
-    evaluate(agent.step, eval_env, cfg.step, device, args.logdir, env_steps, writer)
-    torch.save({"agent": agent.state_dict(), "step": env_steps},
-               os.path.join(args.logdir, "latest.pt"))
+    torch.save({"model": model.state_dict(), "step": env_steps, "cfg_w": cfg.w,
+                "cfg_G": cfg.G}, os.path.join(args.logdir, "latest.pt"))
     print("Done.")
 
 

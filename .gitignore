@@ -49,3 +49,6 @@ tools/build_master_doc.py
 
 # External code — use upstream repos + your Drive copy; not vendored here (see README)
 third_party/
+
+# Build artifacts
+*.zip

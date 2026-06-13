@@ -1,205 +1,151 @@
-"""NexusAgent — ties the EMERALD step tier (reused verbatim) to the new skill tier.
+"""NexusWM — the segment-native world model (strict bottleneck), Phases N0/N1.
 
-v1 scope:
-  * Step tier (Stage 1): EMERALD's world model + actor-critic, used exactly as-is via
-    `emerald_torch`. **Documented v1 gap:** the step actor is NOT yet skill-conditioned
-    (the doc's "+1 input"); that closes the Stage-4 loop and is the one deferred piece.
-  * Skill tier (Stages 2-3): segmentation (segment.py) → jumpy WM training (terminal
-    MaskGIT + Σr + τ + continue + Hₙ), skill VQ, boundary-proposer imitation, and a
-    compact HL actor-critic in jumpy imagination (γ^τ).
+Ties together: the shared frame encoder (EMERALD, the encoder "serves two masters" — both
+clocks backprop into it), the fast tier (§2.3, segment-local with the boundary rebuild +
+w-leak), the slow posterior (§2.4), and the slow prior / jumpy model (§2.5). Computes the
+§4 loss and the §8 self-auditing diagnostics (post-boundary NLL spike, grounding-vs-copy
+advantage, u-stream health).
+
+N1 = full WM with seg=scheduled. No actor yet (that is N2); this trains the world model
+only and reports whether (u_n, z_{t_n}) suffices to re-init prediction across a boundary.
 """
 
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 
-from emerald_torch.model import EmeraldAgent
-from . import segment as segmod
-from .jumpy import JumpyWM
-from .segment import BoundaryProposer
-from .skill import SkillEncoder
+from emerald_torch import nets as enets
+from .fast import FastTier
+from .slow import SlowPosterior, SlowPrior
+from .common import kl_onehot
 
 
-def terminal_loss(jumpy, c, z_term):
-    """CE of the terminal latent under the jumpy MaskGIT (direct + masked). c (B,N,H),
-    z_term (B,N,SV,4,4). Returns (direct (B,N), masked (B,N))."""
-    cond = jumpy.cond(c)
-    logits, logits_masked, mmask = jumpy.terminal.train_logits(z_term, cond)
-    S, V = jumpy.terminal.S, jumpy.terminal.V
-    tgt = z_term.permute(0, 1, 3, 4, 2).reshape(*logits.shape[:4], S, V)
-    direct = -(tgt * torch.log_softmax(logits, dim=-1)).sum(-1).sum((-3, -2, -1))
-    if logits_masked is not None:
-        ce = -(tgt * torch.log_softmax(logits_masked, dim=-1)).sum(-1)        # (B,N,4,4,S)
-        m = mmask.float()
-        masked = (ce * m).sum((-3, -2, -1)) / (m.sum((-3, -2, -1)) + 1e-8)
-    else:
-        masked = torch.zeros_like(direct)
-    return direct, masked
+def _grid(z, S, V):
+    """stoch (B,N,S*V,4,4) -> grid (B,N,4,4,S,V) (S-major, matching the encoder)."""
+    return z.permute(0, 1, 3, 4, 2).reshape(*z.shape[:2], 4, 4, S, V)
 
 
-class NexusAgent(nn.Module):
+class NexusWM(nn.Module):
     def __init__(self, cfg, num_actions):
         super().__init__()
         self.cfg = cfg
         self.num_actions = num_actions
-        self.step = EmeraldAgent(cfg.step, num_actions)            # EMERALD step tier
-        self.skill_enc = SkillEncoder(cfg, num_actions)
-        self.jumpy = JumpyWM(cfg, num_actions)
-        self.proposer = BoundaryProposer(cfg, num_actions)
-        self.register_buffer("perc_low", torch.tensor(0.0))
-        self.register_buffer("perc_high", torch.tensor(0.0))
+        self.encoder = enets.Encoder(cfg.step)             # shared frame encoder
+        self.fast = FastTier(cfg, num_actions)
+        self.post = SlowPosterior(cfg, num_actions)
+        self.prior = SlowPrior(cfg, num_actions)
 
-    # parameter groups
-    def step_wm_parameters(self):
-        return self.step.wm_parameters()
+    # ---- grounding CE (direct + masked), reusing EMERALD's MaskNetwork ---- #
+    def _grounding(self, z_next, cond):
+        S, V = self.prior.ground.S, self.prior.ground.V
+        cond_map = self.prior.ground_cond(cond)
+        logits, logits_masked, mmask = self.prior.ground.train_logits(z_next, cond_map)
+        tgt = _grid(z_next, S, V)
+        direct = -(tgt * torch.log_softmax(logits, dim=-1)).sum(-1).sum((-3, -2, -1))  # (B,N)
+        if logits_masked is not None:
+            ce = -(tgt * torch.log_softmax(logits_masked, dim=-1)).sum(-1)
+            m = mmask.float()
+            masked = (ce * m).sum((-3, -2, -1)) / (m.sum((-3, -2, -1)) + 1e-8)
+        else:
+            masked = torch.zeros_like(direct)
+        return direct, masked
 
-    def skill_tier_parameters(self):
-        mods = [self.skill_enc, self.jumpy, self.proposer]
-        return [p for m in mods for p in m.parameters()]
+    # ---- full §4 loss --------------------------------------------------- #
+    def loss(self, batch, segs):
+        cfg, step = self.cfg, self.cfg.step
+        image, action = batch["image"], batch["action"]
+        reward, cont = batch["reward"], batch["cont"]
+        B, T = reward.shape
 
-    # ---- latents for the HL stream (run EMERALD WM observe, no grad) ------ #
-    @torch.no_grad()
-    def encode_hl(self, batch):
-        enc = self.step.encoder(batch["image"])
-        post, _ = self.step.tssm.observe(enc["stoch"], batch["action"])
-        return {"stoch": post["stoch"].detach(), "deter": post["deter"].detach(),
-                "action": batch["action"], "reward": batch["reward"], "cont": batch["cont"]}
+        enc = self.encoder(image)
+        z, logits_post = enc["stoch"], enc["logits"]                  # (B,T,SV,4,4), grid
 
-    # ---- assemble padded jump tensors from per-element segments ----------- #
-    def _assemble(self, segs, hl):
-        stoch, deter, reward, cont = hl["stoch"], hl["deter"], hl["reward"], hl["cont"]
-        B = stoch.shape[0]
-        device = stoch.device
-        SV = stoch.shape[2]
-        Nmax = max(max(len(s) for s in segs), 1)
-        z0 = torch.zeros(B, Nmax, SV, 4, 4, device=device)
-        zt = torch.zeros(B, Nmax, SV, 4, 4, device=device)
-        h0 = torch.zeros(B, Nmax, self.cfg.step.dim_model, device=device)
-        a_idx = torch.zeros(B, Nmax, dtype=torch.long, device=device)
-        b_idx = torch.zeros(B, Nmax, dtype=torch.long, device=device)
-        sigmar = torch.zeros(B, Nmax, device=device)
-        tau = torch.ones(B, Nmax, device=device)
-        hlcont = torch.zeros(B, Nmax, 1, device=device)
-        mask = torch.zeros(B, Nmax, device=device)
-        T = reward.shape[1]
-        for b in range(B):
-            for n, (a, e, _k) in enumerate(segs[b]):
-                z0[b, n] = stoch[b, a]
-                zt[b, n] = stoch[b, min(e - 1, T - 1)]
-                h0[b, n] = deter[b, a]
-                a_idx[b, n] = a; b_idx[b, n] = e
-                sigmar[b, n] = reward[b, a:e].sum()
-                tau[b, n] = e - a
-                hlcont[b, n, 0] = cont[b, a:e].prod()
-                mask[b, n] = 1.0
-        return dict(z0=z0, zt=zt, h0=h0, a_idx=a_idx, b_idx=b_idx,
-                    sigmar=sigmar, tau=tau, hlcont=hlcont, mask=mask)
+        # slow posterior: u_n per segment
+        q = self.post(z, action, segs)
+        u_emb = q["emb"]                                             # (B,N,emb_dim)
 
-    # ---- Stage 2+3: segment, then train the jumpy WM + skill + proposer --- #
-    def hl_world_model_loss(self, hl):
-        cfg = self.cfg
-        seg = segmod.segment(cfg, self.proposer, self.skill_enc, self.jumpy, hl)
-        J = self._assemble(seg["segments"], hl)
-        mask = J["mask"]
-        msum = mask.sum().clamp(min=1)
+        # fast tier (segment-local, all losses within segments)
+        fast_loss, fast_m, fast_aux = self.fast.loss(
+            image, z, logits_post, action, reward, cont, segs, u_emb)
 
-        def mmean(x):
-            return (x * mask).sum() / msum
+        # ---- slow targets ------------------------------------------------ #
+        zb = segs.gather_starts(z)                                   # (B,N,SV,4,4)
+        zb_logits = segs.gather_starts(logits_post)                 # (B,N,4,4,S,V)
+        tau = segs.lengths.to(z.dtype).unsqueeze(0).expand(B, -1)    # (B,N)
+        a_summary = segs.seg_mean_feat(action)                      # (B,N,A)
+        reward_sum = segs.seg_sum(reward)                          # (B,N)
+        cont_seg = segs.seg_min(cont)                             # (B,N)
+        z_next = torch.cat([zb[:, 1:], zb[:, -1:]], dim=1)          # (B,N,SV,4,4)
+        valid_next = (torch.arange(segs.N, device=z.device) < segs.N - 1).to(z.dtype)  # (N,)
 
-        # skills for the chosen segments (train-mode VQ updates the codebook)
-        g = self.skill_enc.features(hl["stoch"], hl["action"])
-        ps = self.skill_enc.prefix_sums(g)
-        seg_feat = (ps.gather(1, J["b_idx"].unsqueeze(-1).expand(-1, -1, g.shape[-1]))
-                    - ps.gather(1, J["a_idx"].unsqueeze(-1).expand(-1, -1, g.shape[-1]))) \
-            / (J["b_idx"] - J["a_idx"]).clamp(min=1).unsqueeze(-1)
-        z_q, k_idx, commit_loss, perplexity = self.skill_enc.code_of(seg_feat)
-        k_emb = z_q                                                # straight-through code embed
+        # ---- slow prior + heads ----------------------------------------- #
+        ctx = self.prior.context(u_emb, zb, tau, a_summary)         # (B,N,d)
+        u_prior_logits = self.prior.u_prior_dist(ctx)              # (B,N,G,C)
+        cond = self.prior.cond(ctx, u_emb, zb)
+        heads = self.prior.outcome_heads(cond)
 
-        # Hₙ recurrence + context
-        z_emb = self.jumpy.embed_z(J["z0"])
-        h_emb = self.jumpy.h_proj(J["h0"])
-        tokens = self.jumpy.jump_token(z_emb, k_emb, h_emb, drop_h=True)
-        Hn = self.jumpy.roll_Hn(tokens)
-        c = self.jumpy.context(Hn, z_emb, k_emb)
+        # slow KL (EMERALD's 0.5/0.1 balanced split, free bits, unimix)
+        kl_pr = kl_onehot(q["logits"].detach(), u_prior_logits, cfg.slow_uniform_mix)  # (B,N,G)
+        kl_po = kl_onehot(q["logits"], u_prior_logits.detach(), cfg.slow_uniform_mix)
+        loss_u_kl = (step.loss_kl_prior_scale * kl_pr.clamp(min=cfg.slow_free_bits).mean()
+                     + step.loss_kl_post_scale * kl_po.clamp(min=cfg.slow_free_bits).mean())
 
-        # outcome losses (masked over valid jumps)
-        direct, masked = terminal_loss(self.jumpy, c, J["zt"])
-        heads = self.jumpy.outcome_heads(c)
-        loss_term = mmean(direct) + mmean(masked)
-        loss_sigmar = mmean(-heads["sigma_r"].log_prob(J["sigmar"].unsqueeze(-1)).squeeze(-1))
-        loss_tau = mmean(-heads["tau"].log_prob(J["tau"].unsqueeze(-1)).squeeze(-1))
-        loss_cont = mmean(-heads["continue"].log_prob(J["hlcont"]).squeeze(-1))
+        # grounding (weighted highest); mask the last segment (no next boundary frame)
+        g_direct, g_masked = self._grounding(z_next, cond)
+        gden = valid_next.sum().clamp(min=1) * B
+        loss_ground = ((g_direct + g_masked) * valid_next).sum() / gden
 
-        # boundary proposer imitates the DP posterior marginals
-        blogits = self.proposer(hl["stoch"], hl["action"])
-        loss_prop = F.binary_cross_entropy_with_logits(blogits, seg["marg_target"])
+        loss_tau = -heads["tau"].log_prob(tau.unsqueeze(-1)).mean()
+        loss_r = -heads["sigma_r"].log_prob(reward_sum.unsqueeze(-1)).mean()
+        loss_cont = -heads["cont"].log_prob(cont_seg.unsqueeze(-1)).mean()
 
-        loss = (loss_term + loss_sigmar + loss_tau + loss_cont + commit_loss + loss_prop)
-        metrics = {
-            "hl_terminal": loss_term.item(), "hl_sigmar": loss_sigmar.item(),
-            "hl_tau": loss_tau.item(), "hl_cont": loss_cont.item(),
-            "vq_commit": commit_loss.item(), "vq_perplexity": perplexity.item(),
-            "proposer_bce": loss_prop.item(),
-            "mean_seg_len": seg["stats"]["mean_seg_len"],
-            "mean_n_segs": seg["stats"]["mean_n_segs"],
-        }
-        # detached starts for HL actor-critic imagination
-        starts = {"Hn": Hn.detach(), "z0": J["z0"].detach(), "mask": mask.detach()}
-        return loss, metrics, starts
+        slow_loss = (loss_u_kl
+                     + cfg.ground_scale * loss_ground
+                     + cfg.slow_tau_scale * loss_tau
+                     + cfg.slow_r_scale * loss_r
+                     + cfg.slow_cont_scale * loss_cont)
 
-    # ---- Stage 3: HL actor-critic in jumpy imagination (γ^τ) -------------- #
-    def hl_actor_critic_loss(self, starts):
-        cfg = self.cfg
-        Hn0 = starts["Hn"]; z0 = starts["z0"]; mask = starts["mask"]
-        B, N = mask.shape
-        # flatten valid starts
-        flat = mask.reshape(-1) > 0
-        if flat.sum() == 0:
-            zero = torch.zeros((), device=mask.device, requires_grad=True)
-            return zero, zero, {"hl_actor": 0.0, "hl_value": 0.0}
-        H = Hn0.reshape(-1, Hn0.shape[-1])[flat][:, None, :]      # (P,1,H)
-        z = z0.reshape(-1, *z0.shape[2:])[flat][:, None]          # (P,1,SV,4,4)
+        loss = fast_loss + cfg.lambda_slow * slow_loss
 
+        metrics = dict(fast_m)
+        metrics.update({
+            "loss": loss.item(), "slow_loss": slow_loss.item(),
+            "u_kl": (kl_pr.mean().item()), "ground_nll": loss_ground.item(),
+            "slow_tau": loss_tau.item(), "slow_r": loss_r.item(),
+            "slow_cont": loss_cont.item(),
+        })
+        # diagnostics (§8.1, §8.2, §8.4)
         with torch.no_grad():
-            z_embs, H_seq, actions, taus, rewards = [], [], [], [], []
-            cur_z, cur_H = z, H
-            tok_seq = []
-            for _ in range(cfg.hl_H):
-                z_emb = self.jumpy.embed_z(cur_z)
-                a = self.jumpy.actor_dist(cur_H, z_emb).sample()           # (P,1,K)
-                k_emb = self.skill_enc.vq.lookup(a.argmax(-1))             # (P,1,code)
-                c = self.jumpy.context(cur_H, z_emb, k_emb)
-                heads = self.jumpy.outcome_heads(c)
-                _, s_oh = self.jumpy.terminal.sample(self.jumpy.cond(c), cfg.jumpy_decoding_steps)
-                nz = s_oh.flatten(-2, -1).permute(0, 1, 4, 2, 3)
-                z_embs.append(z_emb); H_seq.append(cur_H); actions.append(a)
-                taus.append(heads["tau"].mode()); rewards.append(heads["sigma_r"].mode())
-                tok = self.jumpy.jump_token(z_emb, k_emb, torch.zeros_like(z_emb), drop_h=False)
-                tok_seq.append(tok)
-                cur_H = self.jumpy.roll_Hn(torch.cat(tok_seq, dim=1))[:, -1:]
-                cur_z = nz
-            z_embs = torch.cat(z_embs, dim=1); H_seq = torch.cat(H_seq, dim=1)
-            actions = torch.cat(actions, dim=1)
-            taus = torch.cat(taus, dim=1).clamp(min=1.0)                   # (P,Hh,1)
-            rewards = torch.cat(rewards, dim=1)
-            values = self.jumpy.critic_dist(H_seq, z_embs).mode()
-            disc = cfg.gamma ** taus                                       # γ^τ
-            # λ-returns over jumps
-            interm = rewards + disc * (1 - cfg.lambda_td) * values
-            vals = [values[:, -1]]
-            for t in reversed(range(interm.shape[1] - 1)):
-                vals.append(interm[:, t] + disc[:, t] * cfg.lambda_td * vals[-1])
-            returns = torch.stack(list(reversed(vals)), dim=1)            # (P,Hh,1)
-            adv = (returns - values).squeeze(-1)
+            metrics.update(self._diagnostics(
+                segs, fast_aux["fast_nll"], g_direct, valid_next, z_next, zb_logits,
+                q["logits"]))
+        return loss, metrics
 
-        # actor
-        dist = self.jumpy.actor_dist(H_seq.detach(), z_embs.detach())
-        logp = dist.log_prob(actions.detach())
-        ent = dist.entropy()
-        actor_loss = -((logp * adv.detach() + cfg.eta_entropy * ent)).mean()
-        # critic
-        vdist = self.jumpy.critic_dist(H_seq.detach(), z_embs.detach())
-        value_loss = -vdist.log_prob(returns.detach()).mean()
-        metrics = {"hl_actor": actor_loss.item(), "hl_value": value_loss.item(),
-                   "hl_returns": returns.mean().item()}
-        return actor_loss, value_loss, metrics
+    # ---- §8 diagnostics ------------------------------------------------- #
+    def _diagnostics(self, segs, fast_nll, g_direct, valid_next, z_next, zb_logits, u_logits):
+        out = {}
+        # 8.1 post-boundary NLL spike: fast-prior NLL by within-segment offset
+        pos = segs.pos_ids
+        mid = pos >= max(8, int(segs.lengths.float().mean().item() // 2))
+        mid_nll = fast_nll[:, mid].mean().item() if mid.any() else float("nan")
+        out["fast_nll_mid"] = mid_nll
+        for k in range(1, 6):
+            sel = pos == k
+            out[f"fast_nll_off{k}"] = fast_nll[:, sel].mean().item() if sel.any() else float("nan")
+        if out.get("fast_nll_off1") == out.get("fast_nll_off1") and mid_nll == mid_nll:
+            out["post_boundary_spike"] = out["fast_nll_off1"] - mid_nll
+
+        # 8.2 slow-prior advantage: grounding NLL vs copy-last-boundary-frame baseline
+        S, V = self.prior.ground.S, self.prior.ground.V
+        tgt = _grid(z_next, S, V)                                   # (B,N,4,4,S,V) one-hot
+        copy_logp = torch.log_softmax(zb_logits, dim=-1)
+        copy_nll = -(tgt * copy_logp).sum(-1).sum((-3, -2, -1))     # (B,N)
+        den = valid_next.sum().clamp(min=1) * z_next.shape[0]
+        out["ground_nll_diag"] = (g_direct * valid_next).sum().item() / den.item()
+        out["copy_nll_diag"] = (copy_nll * valid_next).sum().item() / den.item()
+        out["slow_advantage"] = out["copy_nll_diag"] - out["ground_nll_diag"]
+
+        # 8.4 u-stream health: per-token perplexity (collapse check)
+        probs = torch.softmax(u_logits, dim=-1).mean(dim=(0, 1))    # (G,C)
+        ent = -(probs * torch.log(probs + 1e-8)).sum(-1)           # (G,)
+        out["u_perplexity"] = torch.exp(ent).mean().item()
+        return out
