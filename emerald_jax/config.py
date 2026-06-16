@@ -50,6 +50,24 @@ def craftax():
     return c
 
 
+def craftax_fast():
+    """GPU throughput preset. The model is LAUNCH-OVERHEAD-bound (it under-fills the
+    A100 at 16x16 — GPU ~idle between many tiny kernels), so the highest-leverage,
+    numerically-faithful win is more work per kernel launch: bigger batch + more
+    parallel envs. Architecture/hparams are IDENTICAL to craftax() — only parallelism
+    changes, so per-sample math is unchanged (safe for cross-run comparisons).
+
+    capacity is scaled down so capacity*num_envs (total stored transitions, and thus
+    replay GPU memory ~ cap*num_envs*3*64*64 bytes uint8) stays ~constant vs craftax().
+    Tune batch_size / num_envs up to fill YOUR GPU; keep cap*num_envs roughly fixed.
+    """
+    c = craftax()
+    c.num_envs = 64          # 4x more parallel envs collected per scan step
+    c.batch_size = 32        # 2x bigger train batch -> amortizes the per-step launch cost
+    c.capacity = 5000        # 5000*64 == 20000*16 transitions -> same ~3.9GB buffer
+    return c
+
+
 def tiny():
     """Tiny correctness/shape-shakeout preset (CPU)."""
     c = base()

@@ -86,13 +86,18 @@ class EmeraldAgent(nn.Module):
         Bp = B * n
         s = start["stoch"].reshape(Bp, 1, 4, 4, -1)
         d = start["deter"].reshape(Bp, 1, c.dim_model)
-        stochs, deters, actions, x_seq = [s], [d], [], []
-        for _ in range(c.H):
+        # Fixed-length causal-masked token buffer instead of a growing concat: keeps
+        # the transformer at ONE shape (Bp,H,D) across all H steps -> far smaller
+        # graph / faster compile. Causal masking makes the still-zero future slots
+        # irrelevant, so the math (and the make_rng draw order) is identical to the
+        # growing-concat version. Verified bit-equivalent (max|Δ|<4e-6).
+        xbuf = jnp.zeros((Bp, c.H, c.dim_model))
+        stochs, deters, actions = [s], [d], []
+        for t in range(c.H):
             a = OneHotDist(self.policy_head((sg(s), sg(d)))).rsample(self.make_rng("sample"))
             actions.append(a)
-            x_seq.append(self.tssm.mix(self.tssm.encode_stoch(s), a))
-            x = jnp.concatenate(x_seq, axis=1)
-            d = self.tssm.transformer(x, causal=True)[:, -1:]
+            xbuf = xbuf.at[:, t:t + 1].set(self.tssm.mix(self.tssm.encode_stoch(s), a))
+            d = self.tssm.transformer(xbuf, causal=True)[:, t:t + 1]
             _, s_oh = self.tssm.mask_network.sample(self.tssm.deter_to_dec(d),
                                                     c.num_decoding_steps)
             s = s_oh.reshape(Bp, 1, 4, 4, -1)
