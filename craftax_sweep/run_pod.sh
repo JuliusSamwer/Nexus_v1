@@ -30,8 +30,9 @@ fi
 cd "$REPO_DIR"
 git --no-pager log --oneline -1
 
-echo "=== 2. install (one consistent jax+craftax resolve) ==="
-pip install -q -U "jax[cuda12]" flax optax craftax
+echo "=== 2. install (single consistent resolve; NO -U — it triggers dependency"
+echo "        backtracking against craftax's pinned jax range and stalls for ages) ==="
+pip install "jax[cuda12]" craftax flax optax
 
 echo "=== 3. gpu + jax sanity ==="
 nvidia-smi --query-gpu=name,memory.total,memory.used,utilization.gpu --format=csv || true
