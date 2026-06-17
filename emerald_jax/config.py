@@ -68,6 +68,32 @@ def craftax_fast():
     return c
 
 
+def craftax_fast_tiny_wm():
+    """Scale-down capacity-sweep arm: the SMALL world model.
+
+    Identical collection/data regime to craftax_fast() (num_envs=64, batch_size=32,
+    L=64, H=15, capacity, all loss scales / lrs / gamma) — ONLY the world-model
+    capacity is reduced, so the full-vs-tiny comparison is controlled (same "world",
+    weaker model). This tests the hypothesis that a weaker WM (closer to the real-world
+    regime where the model is weaker than the world) makes the conditional-divergence /
+    learned-trust signal stronger. A flat/null result is itself informative.
+
+    Capacity cuts (vs craftax_fast): dim_model 512->128, dim_cnn 32->16,
+    num_heads_trans 8->4, num_blocks_trans 4->2, num_blocks_mask 2->1,
+    reduced_channels 128->64. The latent TARGET (stoch_size=32, discrete=32) is held
+    fixed so the prediction problem's difficulty is unchanged. Divisibility verified:
+    num_heads_trans(4) | dim_model(128) and | 8*dim_cnn(128).
+    """
+    c = craftax_fast()
+    c.dim_model = 128
+    c.dim_cnn = 16
+    c.num_heads_trans = 4
+    c.num_blocks_trans = 2
+    c.num_blocks_mask = 1
+    c.reduced_channels = 64
+    return c
+
+
 def tiny():
     """Tiny correctness/shape-shakeout preset (CPU)."""
     c = base()

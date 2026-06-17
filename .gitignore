@@ -9,9 +9,14 @@ dist/
 
 # Envs
 .venv/
+.venv_jax/
 venv/
 env_jax/
 env_torch/
+
+# Local pickled checkpoints (sweep arms etc.) — large, regenerable
+*.pkl
+ckpts/
 
 # Results / artifacts (keep code, not outputs)
 results/**/*.pt
