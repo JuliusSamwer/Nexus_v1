@@ -170,7 +170,14 @@ class EmeraldJaxAdapter(WMAdapter):
         import jax, jax.numpy as jnp
         from emerald_jax import config as cfgmod, env as envmod, model as modelmod, dists
         self.jax, self.jnp, self.dists = jax, jnp, dists
-        self.cfg = cfg or cfgmod.tiny()
+        # Load the checkpoint blob FIRST so we can rebuild the agent from the cfg it was
+        # trained with (full vs tiny have different dims) instead of a hardcoded preset.
+        blob = None
+        if checkpoint:
+            import pickle
+            with open(checkpoint, "rb") as f:
+                blob = pickle.load(f)
+        self.cfg = (blob.get("cfg") if blob else None) or cfg or cfgmod.tiny()
         self.envmod = envmod
         self.env, self.eparams = envmod.make_env(auto_reset=True)
         self.A = envmod.NUM_ACTIONS
@@ -203,10 +210,8 @@ class EmeraldJaxAdapter(WMAdapter):
                  "action": jax.nn.one_hot(jnp.zeros((B, L), jnp.int32), self.A),
                  "reward": jnp.zeros((B, L)), "cont": jnp.ones((B, L))}
         rngs = {k: key for k in ("params", "sample", "mask", "order")}
-        if checkpoint:
-            import pickle
-            with open(checkpoint, "rb") as f:
-                self.params = pickle.load(f)["params"]
+        if blob is not None:
+            self.params = blob["params"]
         else:
             self.params = self.agent.init(rngs, dummy, 0.0, 0.0,
                                           method=self.agent.compute_losses)
@@ -223,12 +228,33 @@ class EmeraldJaxAdapter(WMAdapter):
         img, state = self.envmod.reset(self.env, self.eparams, keys)   # (1,3,64,64)
         frames = [np.asarray(img)[0]]
         acts = [0]
+        # Drive the env with the AGENT'S POLICY so rollouts visit decision-relevant
+        # states (not a random walk). mixture_p = exploration fraction: each step takes a
+        # uniform-random action w.p. mixture_p, else the policy's sampled action. So
+        # mixture_p=0 is pure on-policy, mixture_p=1 recovers the old random behaviour.
+        # The latent history rings (sr, ar) are maintained + reset-on-done exactly as in
+        # train.make_rollout, so the policy acts as it did during training.
+        ctx = self.cfg.att_context_left
+        SV = self.cfg.stoch_size * self.cfg.discrete
+        sr = jnp.zeros((1, ctx, 4, 4, SV))
+        ar = jnp.zeros((1, ctx, self.A))
         for w in range(warmup + H):
-            a = int(rng.integers(self.A))                              # smoke: random source
-            key, sk = jax.random.split(key)
-            act = jnp.array([a], jnp.int32)
+            key, ak, sk = jax.random.split(key, 3)
+            a_oh_pol, stoch_t = self.agent.apply(
+                self.params, img[:, None], sr, ar, True,
+                method=self.agent.act, rngs={"sample": ak})
+            if rng.random() < mixture_p:
+                a = int(rng.integers(self.A))
+            else:
+                a = int(np.asarray(a_oh_pol).argmax(-1)[0])
+            a_oh = jax.nn.one_hot(jnp.array([a]), self.A)              # (1,A)
             img, state, r, d, info = self.envmod.step(
-                self.env, self.eparams, jax.random.split(sk, 1), state, act)
+                self.env, self.eparams, jax.random.split(sk, 1), state,
+                jnp.array([a], jnp.int32))
+            sr = jnp.concatenate([sr[:, 1:], stoch_t[:, None]], axis=1)
+            ar = jnp.concatenate([ar[:, 1:], a_oh[:, None]], axis=1)
+            if bool(np.asarray(d)[0]):                                  # reset history on episode end
+                sr = jnp.zeros_like(sr); ar = jnp.zeros_like(ar)
             frames.append(np.asarray(img)[0])
             acts.append(a)
         T = len(frames)
