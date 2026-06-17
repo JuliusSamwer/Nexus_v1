@@ -128,9 +128,17 @@ def main():
         st["buf"] = replay.add_rollout(st["buf"], img, a_int, reward, done)
         st["env_step"] += args.collect_steps * cfg.num_envs
 
-    print(f"[prefill] to {cfg.prefill} env-steps...", flush=True)
-    while st["env_step"] < cfg.prefill:
-        collect(True)
+    # Fill the replay buffer to a healthy level before any grad steps. The buffer is
+    # NOT checkpointed (it's ~GBs and regenerable), so this ALSO runs on --resume to
+    # rebuild it from the restored policy. Gating on buffer FILL (not env_step) makes
+    # the fresh-start and resume paths identical and removes the degenerate thin-buffer
+    # transient that an env_step-gated prefill would skip on resume.
+    warmup_rows = int(min(cfg.capacity, max(cfg.prefill // cfg.num_envs, 8 * cfg.L)))
+    if int(st["buf"].size) < warmup_rows:
+        print(f"[warmup] filling replay buffer to {warmup_rows} rows "
+              f"(have {int(st['buf'].size)})...", flush=True)
+        while int(st["buf"].size) < warmup_rows:
+            collect(True)
 
     n_grad = max(1, int(args.gpc * args.collect_steps))
     # align milestone/eval/log to the current step so --resume doesn't refire them
