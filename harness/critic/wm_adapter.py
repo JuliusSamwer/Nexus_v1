@@ -186,15 +186,21 @@ class EmeraldJaxAdapter(WMAdapter):
 
         class _ImagineAgent(modelmod.EmeraldAgent):
             def imagine_actions(self, start_stoch, start_deter, actions):
+                # Fixed-length causal-masked buffer instead of a growing concat — same
+                # trick as EmeraldAgent.imagine(). Keeps the transformer at ONE shape
+                # (B,H,dim_model) across all steps, so the eval graph compiles in ~secs
+                # instead of the ~27min the growing-concat O(H) graph took. Causal masking
+                # makes the still-zero future slots irrelevant -> numerically equivalent.
                 c = self.cfg
                 B = start_stoch.shape[0]
+                H = actions.shape[1]
                 s, d = start_stoch, start_deter
-                stochs, deters, logs, x_seq = [s], [d], [], []
-                for h in range(actions.shape[1]):
+                xbuf = jnp.zeros((B, H, c.dim_model))
+                stochs, deters, logs = [s], [d], []
+                for h in range(H):
                     a = actions[:, h:h + 1]
-                    x_seq.append(self.tssm.mix(self.tssm.encode_stoch(s), a))
-                    x = jnp.concatenate(x_seq, axis=1)
-                    d = self.tssm.transformer(x, causal=True)[:, -1:]
+                    xbuf = xbuf.at[:, h:h + 1].set(self.tssm.mix(self.tssm.encode_stoch(s), a))
+                    d = self.tssm.transformer(xbuf, causal=True)[:, h:h + 1]
                     lg, s_oh = self.tssm.mask_network.sample(
                         self.tssm.deter_to_dec(d), c.num_decoding_steps)
                     s = s_oh.reshape(B, 1, 4, 4, -1)
