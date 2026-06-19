@@ -77,7 +77,7 @@ def vp_sensitivity(m, stoch, deter):
 
 
 class FTAgent(model.EmeraldAgent):
-    def finetune_losses(self, batch, perc_low, perc_high, arm, decision_w):
+    def finetune_losses(self, batch, perc_low, perc_high, arm, decision_w, roll_H):
         c = self.cfg
         # --- P2: phase-2 actor-critic retrain on the FROZEN (improved) WM. ---
         # actor_critic_loss only routes gradient to policy/value heads (imagined rollout is
@@ -100,11 +100,14 @@ class FTAgent(model.EmeraldAgent):
         if arm in ("A1", "A2"):
             enc = self.encoder(batch["image"])
             post, _ = self.tssm.observe(enc["stoch"], batch["action"])
-            real_tok = sg(jnp.argmax(enc["logits"], -1))         # (B,L,4,4,S) targets
-            pred_logits = rollout_tf_logits(self, post["stoch"][:, :1], batch["action"])
-            ce = optax.softmax_cross_entropy_with_integer_labels(pred_logits, real_tok)  # (B,L,4,4,S)
+            # roll only roll_H steps (the decision horizon we care about) instead of all L:
+            # ~L/H fewer sequential transformer passes -> much faster + smaller graph.
+            H = min(roll_H, batch["action"].shape[1])
+            real_tok = sg(jnp.argmax(enc["logits"][:, :H], -1))  # (B,H,4,4,S) targets
+            pred_logits = rollout_tf_logits(self, post["stoch"][:, :1], batch["action"][:, :H])
+            ce = optax.softmax_cross_entropy_with_integer_labels(pred_logits, real_tok)
             if arm == "A2":
-                w = vp_sensitivity(self, sg(post["stoch"]), sg(post["deter"]))
+                w = vp_sensitivity(self, sg(post["stoch"][:, :H]), sg(post["deter"][:, :H]))
                 decision_loss = (w * ce).mean()
             else:
                 decision_loss = ce.mean()
@@ -121,6 +124,7 @@ def main():
     ap.add_argument("--arm", required=True, choices=["A0", "A1", "A2", "P2"])
     ap.add_argument("--steps", type=int, default=8000)
     ap.add_argument("--decision_w", type=float, default=1.0)
+    ap.add_argument("--roll_H", type=int, default=15, help="multi-step rollout horizon (was L=64)")
     ap.add_argument("--lr_scale", type=float, default=0.3, help="scale pretrain LRs for finetune")
     ap.add_argument("--collect_steps", type=int, default=64)
     ap.add_argument("--grad_per_collect", type=int, default=8)
@@ -158,7 +162,7 @@ def main():
 
     def loss_fn(p, batch, perc, rk):
         ks = jax.random.split(rk, 3)
-        return agent.apply(p, batch, perc[0], perc[1], args.arm, args.decision_w,
+        return agent.apply(p, batch, perc[0], perc[1], args.arm, args.decision_w, args.roll_H,
                            rngs={"sample": ks[0], "mask": ks[1], "order": ks[2]},
                            method=agent.finetune_losses)
 
