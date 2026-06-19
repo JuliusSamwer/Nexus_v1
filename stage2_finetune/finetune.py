@@ -79,6 +79,20 @@ def vp_sensitivity(m, stoch, deter):
 class FTAgent(model.EmeraldAgent):
     def finetune_losses(self, batch, perc_low, perc_high, arm, decision_w):
         c = self.cfg
+        # --- P2: phase-2 actor-critic retrain on the FROZEN (improved) WM. ---
+        # actor_critic_loss only routes gradient to policy/value heads (imagined rollout is
+        # stop-gradded), so the WM is naturally frozen — just skip the WM/decision terms.
+        if arm == "P2":
+            enc = self.encoder(batch["image"])
+            post, _ = self.tssm.observe(enc["stoch"], batch["action"])
+            s = c.img_stride
+            detached = {"stoch": sg(post["stoch"][:, ::s]), "deter": sg(post["deter"][:, ::s]),
+                        "cont": sg(batch["cont"][:, ::s])}
+            a_loss, v_loss, ac_metrics, perc_new = self.actor_critic_loss(detached, perc_low, perc_high)
+            total = a_loss + v_loss
+            metrics = {**ac_metrics, "decision_loss": jnp.zeros(()), "image_loss": jnp.zeros(()),
+                       "total_loss": total}
+            return total, (metrics, perc_new)
         # --- standard world-model loss (recon anchor) + posterior states ---
         wm_loss, wm_metrics, detached = self.world_model_loss(batch)
         # --- multi-step own-rollout decision/state term ---
@@ -104,7 +118,7 @@ class FTAgent(model.EmeraldAgent):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--checkpoint", required=True)
-    ap.add_argument("--arm", required=True, choices=["A0", "A1", "A2"])
+    ap.add_argument("--arm", required=True, choices=["A0", "A1", "A2", "P2"])
     ap.add_argument("--steps", type=int, default=8000)
     ap.add_argument("--decision_w", type=float, default=1.0)
     ap.add_argument("--lr_scale", type=float, default=0.3, help="scale pretrain LRs for finetune")
